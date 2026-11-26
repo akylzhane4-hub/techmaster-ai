@@ -261,6 +261,25 @@ body.bt-hide #app>*:not(.tabs){transition:opacity .2s ease,transform .2s ease,fi
 .tab{transition:color .3s}.tab.on{transition:color .3s,border-color .3s}
 #ld.out{transition:transform .9s cubic-bezier(.65,0,.15,1),opacity .9s}
 </style>
+<script>
+/* TechMaster AI: ИИ (Google Gemini) через серверную функцию Netlify; в claude.ai — Claude */
+window.tmSample=async function(){
+  try{
+    const r=await fetch('/api/status',{cache:'no-store'});const j=await r.json();
+    if(j&&j.ai){
+      return async function(input,opts){opts=opts||{};
+        const p=typeof input==='string'?input:input.map(m=>m.content).join('\n\n');
+        const r=await fetch('/api/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:p})});
+        const k=await r.json().catch(()=>({}));if(!r.ok||!k.text)throw new Error(k.error||'ai');
+        if(opts.onText)opts.onText({text:k.text,delta:k.text});
+        return {text:k.text,truncated:false,via:'ИИ · Google Gemini'};
+      };
+    }
+  }catch(e){}
+  try{if(window.claude&&claude.use)return await claude.use('sample')}catch(e){}
+  return null;
+};
+</script>
 </head>
 <body>
 <div id="ld" role="status" aria-label="Загрузка">
@@ -872,10 +891,10 @@ async function run(){
   mark();const tm=setInterval(()=>{if(n<STEPS.length-1){n++;mark()}},1100);
   let text='';
   try{
-    const sample=await claude.use('sample');if(!sample)throw new Error('na');
+    const sample=await tmSample();if(!sample)throw new Error('na');
     const prompt=`Ты технолог-эксперт по производству бетона. Проанализируй партию и ответь на русском в markdown, строго с разделами ### Проверка параметров, ### Вероятные причины дефекта (список по убыванию вероятности, с кратким пояснением), ### Корректировка состава (конкретные числа в кг/м³), ### Экономия материалов (оценка в кг/м³ и %), ### Вывод (1-2 предложения). Не более 320 слов, без вступлений.\n\nДанные партии: бетон ${d.grade}, ${d.vol} м³, ${d.cemT}, подвижность ${d.slT}, щебень до ${d.agg} мм, пластификатор: ${d.pl?'да':'нет'}, влажность песка ${d.sm}%.\nРасчётный состав на 1 м³: цемент ${f0(r.C)} кг, вода ${f0(r.waterAdj)} кг, песок влажный ${f0(r.sandWet)} кг, щебень ${f0(r.Sh)} кг, расчётное В/Ц ${r.wc.toFixed(2)}.\nФактический контроль: осадка конуса ${d.slf} см, прочность 7 сут ${d.r7} МПа, температура смеси ${d.tm} °C, фактическое В/Ц ${d.wcf}.\nПрогноз прочности в 28 сут по факту 7 сут: ${f1(fc(d,r).R28)} МПа при требуемой средней ${f1(r.Rm)} МПа.\nУсловия эксплуатации: ${d.condT} (предельное В/Ц ${d.cap}). Дефект: ${DEF[d.def]}. Комментарий: ${d.cm||'нет'}.`;
     const res=await sample(prompt,{modelTier:'default',cache:false,onText:({text:t})=>{text=t;$('aiout').innerHTML=md(t)}});
-    text=res.text||text;if(!text.trim())throw new Error('empty');
+    text=res.text||text;if(!text.trim())throw new Error('empty');if(res.via)$('mode').textContent=res.via;
   }catch(e){text=localAnalysis(d,r);$('mode').textContent='офлайн-режим'}
   clearInterval(tm);n=STEPS.length;mark();$('aiout').innerHTML=md(text);
   $('rep').textContent=buildReport(d,r,text);
@@ -1007,9 +1026,9 @@ async function diag(){
   btn.disabled=true;btn.textContent=' ИИ думает…';$('dc').scrollIntoView({behavior:'smooth'});
   let text='';
   try{
-    const sample=await claude.use('sample');if(!sample)throw new Error('na');
+    const sample=await tmSample();if(!sample)throw new Error('na');
     const res=await sample(`Ты технолог-эксперт по производству строительных материалов. Продукция: ${PT[pt]}. Описание дефекта и условий: ${txt||'не указано'}.\nОтветь на русском в markdown строго с разделами ### Вероятные причины (по убыванию вероятности, с пояснением), ### Как проверить (конкретные способы и испытания), ### Как исправить, ### Как предотвратить. Не более 280 слов, без вступлений.`,{modelTier:'default',cache:false,onText:({text:t})=>{text=t;$('dout').innerHTML=md(t)}});
-    text=res.text||text;if(!text.trim())throw new Error('empty');
+    text=res.text||text;if(!text.trim())throw new Error('empty');if(res.via)$('dmode').textContent=res.via;
   }catch(e){
     text=`### Вероятные причины\n${FB[pt].map((x,i)=>`${i+1}. ${x}`).join('\n')}\n\n### Как проверить\n- Сверить журнал замесов и режим твёрдения\n- Провести испытания контрольных образцов\n\n### Как исправить\n- Устранить выявленную причину и откорректировать режим\n\n### Как предотвратить\n- Ввести контроль параметров на каждой партии`;
     $('dmode').textContent='офлайн-режим';
