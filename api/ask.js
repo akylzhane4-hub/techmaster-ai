@@ -3,7 +3,7 @@ const KEY = () => (process.env.GEMINI_API_KEY || "").trim();
 const API = "https://generativelanguage.googleapis.com/v1beta";
 const SYS_TASK = "Ты — ИИ-ассистент TechMaster AI для инженера-технолога производства строительных материалов. Отвечай по-русски, кратко и конкретно, в Markdown.";
 const SYS_CHAT = "Ты — ИИ-ассистент TechMaster AI, дружелюбный помощник на сайте для инженеров-технологов. Твоя специализация — технология строительных материалов: бетон и растворы, кирпич, газоблок, сухие смеси, рецептуры, ГОСТы, дефекты и их причины, контроль качества, экономия сырья, отчёты. Но ты помогаешь и с любыми другими вопросами пользователя. Отвечай на языке вопроса (по умолчанию по-русски), понятно и по делу, используй Markdown (короткие абзацы, списки, **жирный** для главного). Если вопрос про расчёт — показывай формулу и ход решения. Если данных не хватает — уточни. Не выдумывай нормативы и цифры: если не уверен, так и скажи.";
-let MODEL = (process.env.GEMINI_MODEL || "").trim();
+let MODEL = ""; // последняя модель, которая ответила
 
 async function listModels() {
   const r = await fetch(`${API}/models?pageSize=200`, { headers: { "x-goog-api-key": KEY() } });
@@ -16,14 +16,18 @@ async function listModels() {
 
 // Порядок моделей: сначала самые новые «flash» (gemini-3.8-flash, 3.6, 3.5 …), затем остальные подходящие.
 const ver = (n) => { const m = n.match(/^gemini-(\d+(?:\.\d+)?)-flash$/); return m ? parseFloat(m[1]) : -1; };
+// Порядок: сначала модель, которая уже ответила, затем проверенные бесплатные, затем остальные.
+const PREFER = ["gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-flash-latest", "gemini-3.6-flash", "gemini-3.1-flash-lite", "gemini-flash-lite-latest"];
+let NAMES = null;
 async function candidates() {
-  if (MODEL) return [MODEL];
-  const names = await listModels();
+  if (process.env.GEMINI_MODEL) return [process.env.GEMINI_MODEL.trim()];
+  if (!NAMES) NAMES = await listModels();
+  const names = NAMES;
   const exact = names.filter((n) => ver(n) > 0).sort((x, y) => ver(y) - ver(x));
-  const bad = /image|tts|live|audio|embedding|thinking|robotics|computer/;
+  const bad = /image|tts|live|audio|embedding|thinking|robotics|computer|transcribe/;
   const other = names.filter((n) => /flash/.test(n) && !bad.test(n) && !exact.includes(n))
-    .sort((x, y) => (/preview|exp/.test(x) - /preview|exp/.test(y)) || (/lite/.test(x) - /lite/.test(y)) || y.localeCompare(x));
-  const list = [...(names.includes("gemini-flash-latest") ? ["gemini-flash-latest"] : []), ...exact, ...other];
+    .sort((x, y) => (/preview|exp/.test(x) - /preview|exp/.test(y)) || y.localeCompare(x));
+  const list = [...(MODEL ? [MODEL] : []), ...PREFER.filter((n) => names.includes(n)), ...exact, ...other];
   const uniq = [...new Set(list)];
   if (!uniq.length) throw new Error("no models available for this key");
   return uniq;
@@ -69,7 +73,7 @@ async function gemini(system, contents, log = []) {
   const left = () => DEADLINE - (Date.now() - t0);
   const list = await candidates();
   let last, model;
-  for (model of list.slice(0, 6)) {
+  for (model of list.slice(0, 7)) {
     if (left() < 4000) break;
     last = await tryModel(model, system, contents, left, log);
     if (last.ok) { MODEL = model; break; }
@@ -77,7 +81,6 @@ async function gemini(system, contents, log = []) {
     if (![400, 403, 404, 429, 500, 503, 504, 599].includes(last.status)) break;
   }
   if (!last?.ok) {
-    if (!process.env.GEMINI_MODEL) MODEL = "";
     const e = new Error(`gemini ${last?.status}: ${last?.j?.error?.message || "error"} (model ${model})`);
     e.log = log; throw e;
   }
