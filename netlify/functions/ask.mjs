@@ -1,8 +1,9 @@
 // TechMaster AI — ИИ через Google Gemini. Ключ: переменная окружения GEMINI_API_KEY в настройках Netlify.
-// Проверка: /api/status — есть ли ключ; /api/test — пробный запрос к ИИ (показывает модель или ошибку).
+// Адреса: /api/status — есть ли ключ; /api/test — пробный запрос к ИИ; /api/ask — анализ (prompt) и чат (messages).
 const KEY = () => (process.env.GEMINI_API_KEY || "").trim();
 const API = "https://generativelanguage.googleapis.com/v1beta";
-const SYSTEM = "Ты — ИИ-ассистент TechMaster AI для инженера-технолога производства строительных материалов. Отвечай по-русски, только по теме технологии стройматериалов, кратко и конкретно, в Markdown.\n\n";
+const SYS_TASK = "Ты — ИИ-ассистент TechMaster AI для инженера-технолога производства строительных материалов. Отвечай по-русски, кратко и конкретно, в Markdown.";
+const SYS_CHAT = "Ты — ИИ-ассистент TechMaster AI, дружелюбный помощник на сайте для инженеров-технологов. Твоя специализация — технология строительных материалов: бетон и растворы, кирпич, газоблок, сухие смеси, рецептуры, ГОСТы, дефекты и их причины, контроль качества, экономия сырья, отчёты. Но ты помогаешь и с любыми другими вопросами пользователя. Отвечай на языке вопроса (по умолчанию по-русски), понятно и по делу, используй Markdown (короткие абзацы, списки, **жирный** для главного). Если вопрос про расчёт — показывай формулу и ход решения. Если данных не хватает — уточни. Не выдумывай нормативы и цифры: если не уверен, так и скажи.";
 let MODEL = (process.env.GEMINI_MODEL || "").trim();
 
 async function listModels() {
@@ -27,8 +28,8 @@ async function pickModel() {
   return MODEL;
 }
 
-async function call(model, prompt, thinking) {
-  const gen = { temperature: 0.4, maxOutputTokens: 1500 };
+async function call(model, system, contents, thinking) {
+  const gen = { temperature: 0.5, maxOutputTokens: 1500 };
   if (thinking === "budget") gen.thinkingConfig = { thinkingBudget: 0 };
   if (thinking === "level") gen.thinkingConfig = { thinkingLevel: "low" };
   const ctl = new AbortController();
@@ -38,22 +39,21 @@ async function call(model, prompt, thinking) {
       method: "POST",
       signal: ctl.signal,
       headers: { "Content-Type": "application/json", "x-goog-api-key": KEY() },
-      body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }], generationConfig: gen }),
+      body: JSON.stringify({ systemInstruction: { parts: [{ text: system }] }, contents, generationConfig: gen }),
     });
     const j = await r.json().catch(() => ({}));
     return { ok: r.ok, status: r.status, j };
   } finally { clearTimeout(t); }
 }
 
-async function gemini(prompt) {
+async function gemini(system, contents) {
   const model = await pickModel();
   // быстрый режим без долгого «обдумывания», чтобы уложиться во время функции
   const modes = /2\.5/.test(model) ? ["budget", "none"] : /gemini-[3-9]/.test(model) ? ["level", "none"] : ["none"];
   let last;
   for (const m of modes) {
-    last = await call(model, prompt, m);
-    if (last.ok) break;
-    if (last.status !== 400) break; // 400 — модель не поняла настройку, пробуем без неё
+    last = await call(model, system, contents, m);
+    if (last.ok || last.status !== 400) break; // 400 — модель не приняла настройку, пробуем без неё
   }
   if (!last.ok) {
     if (last.status === 404 && !process.env.GEMINI_MODEL) MODEL = "";
@@ -64,7 +64,16 @@ async function gemini(prompt) {
   return { text, model };
 }
 
+function toContents(messages) {
+  const list = (Array.isArray(messages) ? messages : []).slice(-14)
+    .map((m) => ({ role: m?.role === "assistant" ? "model" : "user", parts: [{ text: String(m?.content || "").slice(0, 4000) }] }))
+    .filter((m) => m.parts[0].text.trim());
+  while (list.length && list[0].role !== "user") list.shift();
+  return list;
+}
+
 const json = (o, status = 200) => new Response(JSON.stringify(o), { status, headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" } });
+const errText = (e) => String(e?.name === "AbortError" ? "timeout" : e?.message || e);
 
 export default async (req) => {
   const url = new URL(req.url);
@@ -73,23 +82,31 @@ export default async (req) => {
   if (url.pathname === "/api/test") {
     const t0 = Date.now();
     try {
-      const r = await gemini("Ответь одним словом по-русски: работаешь?");
+      const r = await gemini(SYS_CHAT, [{ role: "user", parts: [{ text: "Ответь одним словом: работаешь?" }] }]);
       return json({ ok: true, model: r.model, ms: Date.now() - t0, answer: r.text.slice(0, 80) });
     } catch (e) {
       let models = null;
-      try { models = (await listModels()).slice(0, 30); } catch (e2) { models = String(e2?.message || e2); }
-      return json({ ok: false, ms: Date.now() - t0, error: String(e?.name === "AbortError" ? "timeout" : e?.message || e), models });
+      try { models = (await listModels()).slice(0, 30); } catch (e2) { models = errText(e2); }
+      return json({ ok: false, ms: Date.now() - t0, error: errText(e), models });
     }
   }
   if (req.method !== "POST") return json({ error: "method" }, 405);
   try {
     const body = await req.json();
-    const prompt = String(body?.prompt || "").slice(0, 8000);
-    if (!prompt.trim()) return json({ error: "empty" }, 400);
-    const r = await gemini(SYSTEM + prompt);
+    let r;
+    if (Array.isArray(body?.messages)) {
+      const contents = toContents(body.messages);
+      if (!contents.length) return json({ error: "empty" }, 400);
+      const ctx = String(body?.context || "").slice(0, 3000);
+      r = await gemini(ctx ? `${SYS_CHAT}\n\nКонтекст с сайта (последний расчёт пользователя, используй если вопрос о нём):\n${ctx}` : SYS_CHAT, contents);
+    } else {
+      const prompt = String(body?.prompt || "").slice(0, 8000);
+      if (!prompt.trim()) return json({ error: "empty" }, 400);
+      r = await gemini(SYS_TASK, [{ role: "user", parts: [{ text: prompt }] }]);
+    }
     return json({ text: r.text, model: r.model });
   } catch (e) {
-    const msg = String(e?.name === "AbortError" ? "timeout" : e?.message || e);
+    const msg = errText(e);
     console.log("AI error:", msg);
     return json({ error: msg }, 502);
   }
