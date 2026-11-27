@@ -65,12 +65,12 @@ async function gemini(system, contents) {
   const t0 = Date.now();
   let last, model, tried = 0;
   for (model of list) {
-    if (tried >= 4 || Date.now() - t0 > 20000) break;
+    if (tried >= 5 || Date.now() - t0 > 24000) break;
     tried++;
     last = await tryModel(model, system, contents);
     if (last.ok) { MODEL = model; break; }
-    // модель недоступна этому ключу — пробуем следующую
-    if (![400, 403, 404].includes(last.status)) break;
+    // модель недоступна или перегружена — пробуем следующую
+    if (![400, 403, 404, 429, 500, 503].includes(last.status)) break;
   }
   if (!last?.ok) {
     if (!process.env.GEMINI_MODEL) MODEL = "";
