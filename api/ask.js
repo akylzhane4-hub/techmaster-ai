@@ -23,18 +23,18 @@ async function candidates() {
   const bad = /image|tts|live|audio|embedding|thinking|robotics|computer/;
   const other = names.filter((n) => /flash/.test(n) && !bad.test(n) && !exact.includes(n))
     .sort((x, y) => (/preview|exp/.test(x) - /preview|exp/.test(y)) || (/lite/.test(x) - /lite/.test(y)) || y.localeCompare(x));
-  const list = [...exact, ...(names.includes("gemini-flash-latest") ? ["gemini-flash-latest"] : []), ...other];
+  const list = [...(names.includes("gemini-flash-latest") ? ["gemini-flash-latest"] : []), ...exact, ...other];
   const uniq = [...new Set(list)];
   if (!uniq.length) throw new Error("no models available for this key");
   return uniq;
 }
 
-async function call(model, system, contents, thinking) {
+async function call(model, system, contents, thinking, ms = 15000) {
   const gen = { temperature: 0.5, maxOutputTokens: 1500 };
   if (thinking === "budget") gen.thinkingConfig = { thinkingBudget: 0 };
   if (thinking === "level") gen.thinkingConfig = { thinkingLevel: "low" };
   const ctl = new AbortController();
-  const t = setTimeout(() => ctl.abort(), 20000);
+  const t = setTimeout(() => ctl.abort(), Math.max(3000, ms));
   try {
     const r = await fetch(`${API}/models/${model}:generateContent`, {
       method: "POST",
@@ -47,34 +47,39 @@ async function call(model, system, contents, thinking) {
   } finally { clearTimeout(t); }
 }
 
-async function tryModel(model, system, contents) {
-  // быстрый режим без долгого «обдумывания», чтобы уложиться во время функции
+const DEADLINE = 50000; // общий запас времени на ответ (функция живёт до 60 с)
+async function tryModel(model, system, contents, left, log) {
   const modes = /gemini-[3-9]/.test(model) ? ["level", "none"] : /2\.5/.test(model) ? ["budget", "none"] : ["none"];
   let last;
   for (const m of modes) {
-    last = await call(model, system, contents, m);
+    const t1 = Date.now();
+    try { last = await call(model, system, contents, m, Math.min(15000, left() - 1500)); }
+    catch (e) { last = { ok: false, status: e?.name === "AbortError" ? 504 : 599, j: { error: { message: e?.name === "AbortError" ? "timeout" : String(e?.message || e) } } }; }
+    log.push(`${model}${m === "none" ? "" : "+" + m}: ${last.ok ? "ok" : last.status} ${Date.now() - t1}ms`);
     if (last.ok) break;
     const msg = String(last.j?.error?.message || "");
     if (!(last.status === 400 && /thinking|generation_config|generationConfig|Unknown name|invalid/i.test(msg))) break;
+    if (left() < 4000) break;
   }
   return last;
 }
 
-async function gemini(system, contents) {
-  const list = await candidates();
+async function gemini(system, contents, log = []) {
   const t0 = Date.now();
-  let last, model, tried = 0;
-  for (model of list) {
-    if (tried >= 5 || Date.now() - t0 > 24000) break;
-    tried++;
-    last = await tryModel(model, system, contents);
+  const left = () => DEADLINE - (Date.now() - t0);
+  const list = await candidates();
+  let last, model;
+  for (model of list.slice(0, 6)) {
+    if (left() < 4000) break;
+    last = await tryModel(model, system, contents, left, log);
     if (last.ok) { MODEL = model; break; }
-    // модель недоступна или перегружена — пробуем следующую
-    if (![400, 403, 404, 429, 500, 503].includes(last.status)) break;
+    // модель недоступна, перегружена или долго отвечает — пробуем следующую
+    if (![400, 403, 404, 429, 500, 503, 504, 599].includes(last.status)) break;
   }
   if (!last?.ok) {
     if (!process.env.GEMINI_MODEL) MODEL = "";
-    throw new Error(`gemini ${last?.status}: ${last?.j?.error?.message || "error"} (model ${model})`);
+    const e = new Error(`gemini ${last?.status}: ${last?.j?.error?.message || "error"} (model ${model})`);
+    e.log = log; throw e;
   }
   const text = (last.j.candidates?.[0]?.content?.parts || []).filter((p) => !p.thought).map((p) => p.text || "").join("").trim();
   if (!text) throw new Error(`empty answer (model ${model}, finish ${last.j.candidates?.[0]?.finishReason || "?"})`);
@@ -94,17 +99,18 @@ const json = (o, status = 200) => new Response(JSON.stringify(o), { status, head
 const errText = (e) => String(e?.name === "AbortError" ? "timeout" : e?.message || e);
 
 // Один файл для Vercel: /api/ask (анализ и чат), /api/status и /api/test (через vercel.json → ?op=…)
-export const config = { maxDuration: 30 };
+export const config = { maxDuration: 60 };
 
 async function test() {
   const t0 = Date.now();
   try {
-    const r = await gemini(SYS_CHAT, [{ role: "user", parts: [{ text: "Ответь одним словом: работаешь?" }] }]);
-    return json({ ok: true, model: r.model, ms: Date.now() - t0, answer: r.text.slice(0, 80) });
+    const log = [];
+    const r = await gemini(SYS_CHAT, [{ role: "user", parts: [{ text: "Ответь одним словом: работаешь?" }] }], log);
+    return json({ ok: true, model: r.model, ms: Date.now() - t0, answer: r.text.slice(0, 80), tries: log });
   } catch (e) {
     let models = null;
     try { models = (await listModels()).slice(0, 40); } catch (e2) { models = errText(e2); }
-    return json({ ok: false, ms: Date.now() - t0, error: errText(e), models });
+    return json({ ok: false, ms: Date.now() - t0, error: errText(e), tries: e?.log || null, models });
   }
 }
 
