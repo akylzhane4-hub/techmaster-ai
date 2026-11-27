@@ -1,0 +1,6 @@
+{
+  "rewrites": [
+    { "source": "/api/status", "destination": "/api/ask?op=status" },
+    { "source": "/api/test", "destination": "/api/ask?op=test" }
+  ]
+}
