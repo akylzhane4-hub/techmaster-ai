@@ -15,17 +15,19 @@ async function listModels() {
     .map((m) => String(m.name).replace("models/", ""));
 }
 
-async function pickModel() {
-  if (MODEL) return MODEL;
+// Порядок моделей: сначала самые новые «flash» (gemini-3.8-flash, 3.6, 3.5 …), затем остальные подходящие.
+const ver = (n) => { const m = n.match(/^gemini-(\d+(?:\.\d+)?)-flash$/); return m ? parseFloat(m[1]) : -1; };
+async function candidates() {
+  if (MODEL) return [MODEL];
   const names = await listModels();
-  const good = (n) => /flash/.test(n) && !/image|tts|live|audio|exp|preview|thinking|embedding/.test(n);
-  const prefer = ["gemini-2.5-flash", "gemini-flash-latest", "gemini-2.0-flash"];
-  MODEL = prefer.find((p) => names.includes(p))
-    || names.filter((n) => good(n) && !/lite/.test(n)).sort().reverse()[0]
-    || names.filter(good).sort().reverse()[0]
-    || names[0];
-  if (!MODEL) throw new Error("no models available for this key");
-  return MODEL;
+  const exact = names.filter((n) => ver(n) > 0).sort((x, y) => ver(y) - ver(x));
+  const bad = /image|tts|live|audio|embedding|thinking|robotics|computer/;
+  const other = names.filter((n) => /flash/.test(n) && !bad.test(n) && !exact.includes(n))
+    .sort((x, y) => (/preview|exp/.test(x) - /preview|exp/.test(y)) || (/lite/.test(x) - /lite/.test(y)) || y.localeCompare(x));
+  const list = [...exact, ...(names.includes("gemini-flash-latest") ? ["gemini-flash-latest"] : []), ...other];
+  const uniq = [...new Set(list)];
+  if (!uniq.length) throw new Error("no models available for this key");
+  return uniq;
 }
 
 async function call(model, system, contents, thinking) {
@@ -33,7 +35,7 @@ async function call(model, system, contents, thinking) {
   if (thinking === "budget") gen.thinkingConfig = { thinkingBudget: 0 };
   if (thinking === "level") gen.thinkingConfig = { thinkingLevel: "low" };
   const ctl = new AbortController();
-  const t = setTimeout(() => ctl.abort(), 22000);
+  const t = setTimeout(() => ctl.abort(), 20000);
   try {
     const r = await fetch(`${API}/models/${model}:generateContent`, {
       method: "POST",
@@ -46,18 +48,34 @@ async function call(model, system, contents, thinking) {
   } finally { clearTimeout(t); }
 }
 
-async function gemini(system, contents) {
-  const model = await pickModel();
+async function tryModel(model, system, contents) {
   // быстрый режим без долгого «обдумывания», чтобы уложиться во время функции
-  const modes = /2\.5/.test(model) ? ["budget", "none"] : /gemini-[3-9]/.test(model) ? ["level", "none"] : ["none"];
+  const modes = /gemini-[3-9]/.test(model) ? ["level", "none"] : /2\.5/.test(model) ? ["budget", "none"] : ["none"];
   let last;
   for (const m of modes) {
     last = await call(model, system, contents, m);
-    if (last.ok || last.status !== 400) break; // 400 — модель не приняла настройку, пробуем без неё
+    if (last.ok) break;
+    const msg = String(last.j?.error?.message || "");
+    if (!(last.status === 400 && /thinking|generation_config|generationConfig|Unknown name|invalid/i.test(msg))) break;
   }
-  if (!last.ok) {
-    if (last.status === 404 && !process.env.GEMINI_MODEL) MODEL = "";
-    throw new Error(`gemini ${last.status}: ${last.j?.error?.message || "error"} (model ${model})`);
+  return last;
+}
+
+async function gemini(system, contents) {
+  const list = await candidates();
+  const t0 = Date.now();
+  let last, model, tried = 0;
+  for (model of list) {
+    if (tried >= 4 || Date.now() - t0 > 20000) break;
+    tried++;
+    last = await tryModel(model, system, contents);
+    if (last.ok) { MODEL = model; break; }
+    // модель недоступна этому ключу — пробуем следующую
+    if (![400, 403, 404].includes(last.status)) break;
+  }
+  if (!last?.ok) {
+    if (!process.env.GEMINI_MODEL) MODEL = "";
+    throw new Error(`gemini ${last?.status}: ${last?.j?.error?.message || "error"} (model ${model})`);
   }
   const text = (last.j.candidates?.[0]?.content?.parts || []).filter((p) => !p.thought).map((p) => p.text || "").join("").trim();
   if (!text) throw new Error(`empty answer (model ${model}, finish ${last.j.candidates?.[0]?.finishReason || "?"})`);
